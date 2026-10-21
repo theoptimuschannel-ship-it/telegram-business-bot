@@ -62,10 +62,11 @@ def extract_media(m: Message) -> tuple[str | None, str | None]:
     return None, None
 
 
-def to_record(m: Message, settings: Settings) -> dict:
+def to_record(m: Message, uid: int) -> dict:
     u = m.from_user
     media_type, file_id = extract_media(m)
     return {
+        "uid": uid,
         "chat_id": m.chat.id,
         "message_id": m.message_id,
         "connection_id": m.business_connection_id,
@@ -77,7 +78,7 @@ def to_record(m: Message, settings: Settings) -> dict:
         "media_type": media_type,
         "file_id": file_id,
         "reply_to": m.reply_to_message.message_id if m.reply_to_message else None,
-        "is_own": int(bool(u and u.id == settings.owner_id)),
+        "is_own": int(bool(u and u.id == uid)),
     }
 
 
@@ -89,28 +90,35 @@ async def store_connection(db: Database, bc: BusinessConnection) -> dict:
     return rights
 
 
-async def is_owner_connection(bot: Bot, db: Database, settings: Settings, conn_id: str | None) -> bool:
+async def connection_user(bot: Bot, db: Database, conn_id: str | None) -> int | None:
+    """Чьё это подключение. None — чужое/неразрешённое, такие события игнорируем."""
     if not conn_id:
-        return False
+        return None
     row = await db.get_connection(conn_id)
     if row:
-        return row["user_id"] == settings.owner_id
+        return row["user_id"] if await db.is_allowed(row["user_id"]) else None
     try:
         bc = await bot.get_business_connection(conn_id)
     except TelegramAPIError as e:
         log.warning("get_business_connection(%s) не удался: %s", conn_id, e)
-        return False
-    if bc.user.id != settings.owner_id:
-        return False
+        return None
+    if not await db.is_allowed(bc.user.id):
+        return None
     await store_connection(db, bc)
-    return True
+    return bc.user.id
 
 
 # ---------- подключение ----------
 @router.business_connection()
 async def on_connection(bc: BusinessConnection, bot: Bot, db: Database, settings: Settings):
-    if bc.user.id != settings.owner_id:
-        log.info("Игнорирую подключение чужого аккаунта %s", bc.user.id)
+    uid = bc.user.id
+    if not await db.is_allowed(uid):
+        log.info("Игнорирую подключение неразрешённого аккаунта %s", uid)
+        if await db.get_user(uid):  # добавлен владельцем, но ещё не принял условия
+            await notify_owner(
+                bot, bc.user_chat_id,
+                "👋 Вас добавили в бота, но доступ ещё не активирован. Откройте бота, нажмите /start и примите условия.",
+            )
         return
     rights = await store_connection(db, bc)
     if bc.is_enabled:
@@ -119,15 +127,16 @@ async def on_connection(bc: BusinessConnection, bot: Bot, db: Database, settings
             text += "\n\n⚠️ Без права «читать сообщения» бэкап работать не будет."
     else:
         text = "❌ <b>Бот отключён</b> от аккаунта."
-    await notify_owner(bot, settings.owner_id, text)
+    await notify_owner(bot, uid, text)
 
 
 # ---------- новые сообщения ----------
 @router.business_message()
 async def on_message(message: Message, bot: Bot, db: Database, settings: Settings):
-    if not await is_owner_connection(bot, db, settings, message.business_connection_id):
+    uid = await connection_user(bot, db, message.business_connection_id)
+    if uid is None:
         return
-    rec = to_record(message, settings)
+    rec = to_record(message, uid)
     try:
         await db.save_message(rec)
     except Exception:
@@ -137,7 +146,7 @@ async def on_message(message: Message, bot: Bot, db: Database, settings: Setting
             await dispatch(bot, db, settings, message)
     else:
         try:
-            await maybe_autoreply(bot, db, settings, message)
+            await maybe_autoreply(bot, db, settings, message, uid)
         except Exception:
             log.exception("Ошибка автоответа")
 
@@ -145,21 +154,22 @@ async def on_message(message: Message, bot: Bot, db: Database, settings: Setting
 # ---------- изменённые ----------
 @router.edited_business_message()
 async def on_edited(message: Message, bot: Bot, db: Database, settings: Settings):
-    if not await is_owner_connection(bot, db, settings, message.business_connection_id):
+    uid = await connection_user(bot, db, message.business_connection_id)
+    if uid is None:
         return
-    if (message.chat.id, message.message_id) in animations.suppressed_edits:
+    if (message.business_connection_id, message.chat.id, message.message_id) in animations.suppressed_edits:
         return
-    old = await db.get_message(message.chat.id, message.message_id)
-    rec = to_record(message, settings)
+    old = await db.get_message(uid, message.chat.id, message.message_id)
+    rec = to_record(message, uid)
     await db.save_message(rec)
 
     old_text = old["text"] if old else None
     if old and (old_text or "") == (rec["text"] or "") and old["media_type"] == rec["media_type"]:
         return
-    await db.incr("stat_edited")
-    if not await db.get_bool("notify_edited") or await db.is_muted(message.chat.id):
+    await db.incr(uid, "stat_edited")
+    if not await db.get_bool(uid, "notify_edited") or await db.is_muted(uid, message.chat.id):
         return
-    if rec["is_own"] and not await db.get_bool("notify_own"):
+    if rec["is_own"] and not await db.get_bool(uid, "notify_own"):
         return
     name = esc(rec["sender_name"] or "?")
     new = esc(clip(rec["text"] or f"[{MEDIA_LABELS.get(rec['media_type'], 'без текста')}]", 1800))
@@ -168,7 +178,7 @@ async def on_edited(message: Message, bot: Bot, db: Database, settings: Settings
         text = f"✏️ <b>{name}</b> изменил сообщение:\n<b>было:</b> {was}\n<b>→ стало:</b> {new}"
     else:
         text = f"✏️ <b>{name}</b> изменил сообщение (старой версии нет в бэкапе):\n<b>стало:</b> {new}"
-    await notify_owner(bot, settings.owner_id, text)
+    await notify_owner(bot, uid, text)
 
 
 # ---------- удалённые ----------
@@ -191,22 +201,24 @@ async def resend_media(bot: Bot, owner_id: int, media_type: str, file_id: str, c
 
 @router.deleted_business_messages()
 async def on_deleted(event: BusinessMessagesDeleted, bot: Bot, db: Database, settings: Settings):
-    if not await is_owner_connection(bot, db, settings, event.business_connection_id):
+    uid = await connection_user(bot, db, event.business_connection_id)
+    if uid is None:
         return
     chat_id = event.chat.id
-    rows = await db.get_messages(chat_id, list(event.message_ids))
+    conn_id = event.business_connection_id
+    rows = await db.get_messages(uid, chat_id, list(event.message_ids))
     found = {r["message_id"] for r in rows}
-    ids = [i for i in event.message_ids if (chat_id, i) not in animations.suppressed_deletions]
+    ids = [i for i in event.message_ids if (conn_id, chat_id, i) not in animations.suppressed_deletions]
     rows = [r for r in rows if r["message_id"] in ids]
     missing = [i for i in ids if i not in found]
     if not rows and not missing:
         return
-    await db.incr("stat_deleted", len(rows))
+    await db.incr(uid, "stat_deleted", len(rows))
 
-    if not await db.get_bool("notify_deleted") or await db.is_muted(chat_id):
+    if not await db.get_bool(uid, "notify_deleted") or await db.is_muted(uid, chat_id):
         return
-    notify_own = await db.get_bool("notify_own")
-    owner = settings.owner_id
+    notify_own = await db.get_bool(uid, "notify_own")
+    owner = uid
     for r in rows:
         if r["is_own"] and not notify_own:
             continue

@@ -48,7 +48,7 @@ def _cooldown_ok(key: tuple, seconds: int) -> bool:
     return True
 
 
-async def maybe_autoreply(bot: Bot, db: Database, settings: Settings, message: Message) -> None:
+async def maybe_autoreply(bot: Bot, db: Database, settings: Settings, message: Message, uid: int) -> None:
     if message.chat.type != "private" or not message.from_user or message.from_user.is_bot:
         return
     chat_id, conn = message.chat.id, message.business_connection_id
@@ -61,11 +61,11 @@ async def maybe_autoreply(bot: Bot, db: Database, settings: Settings, message: M
             log.warning("Автоответ не отправлен: %s", e)
 
     if text:
-        for r in await db.list_autoreplies():
-            if r["keyword"] in text and _cooldown_ok((chat_id, "kw", r["id"]), KEYWORD_COOLDOWN):
+        for r in await db.list_autoreplies(uid):
+            if r["keyword"] in text and _cooldown_ok((uid, chat_id, "kw", r["id"]), KEYWORD_COOLDOWN):
                 await send(r["response"])
                 return
-    if await db.get_bool("away_enabled"):
-        hours = await db.get_setting("away_hours") or ""
-        if in_hours(hours, datetime.now(settings.tz)) and _cooldown_ok((chat_id, "away"), AWAY_COOLDOWN):
-            await send(await db.get_setting("away_text") or "")
+    if await db.get_bool(uid, "away_enabled"):
+        hours = await db.get_setting(uid, "away_hours") or ""
+        if in_hours(hours, datetime.now(settings.tz)) and _cooldown_ok((uid, chat_id, "away"), AWAY_COOLDOWN):
+            await send(await db.get_setting(uid, "away_text") or "")

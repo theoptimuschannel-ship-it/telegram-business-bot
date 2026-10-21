@@ -13,11 +13,11 @@ from handlers.utils import esc, fmt_duration
 log = logging.getLogger(__name__)
 
 # Чаты, где сейчас идёт анимация (одна анимация на чат).
-_active_chats: set[int] = set()
-_stop_requests: set[int] = set()
+_active_chats: set[tuple[str, int]] = set()  # (connection_id, chat_id)
+_stop_requests: set[tuple[str, int]] = set()
 # Правки/удаления, сделанные самим ботом: по ним не шлём уведомления.
-suppressed_edits: set[tuple[int, int]] = set()
-suppressed_deletions: set[tuple[int, int]] = set()
+suppressed_edits: set[tuple[str, int, int]] = set()  # (connection_id, chat_id, message_id)
+suppressed_deletions: set[tuple[str, int, int]] = set()
 
 HEART_COLORS = ["❤️", "🧡", "💛", "💚", "💙", "💜", "🩷"]
 BG = "⬜"
@@ -162,16 +162,16 @@ async def _retry(func, *args, **kwargs):
     return await func(*args, **kwargs)
 
 
-def request_stop(chat_id: int) -> bool:
+def request_stop(conn_id: str, chat_id: int) -> bool:
     """Просит остановить анимацию в чате. False, если анимации нет."""
-    if chat_id not in _active_chats:
+    if (conn_id, chat_id) not in _active_chats:
         return False
-    _stop_requests.add(chat_id)
+    _stop_requests.add((conn_id, chat_id))
     return True
 
 
 async def delete_business_message(bot: Bot, conn_id: str, chat_id: int, message_id: int) -> bool:
-    key = (chat_id, message_id)
+    key = (conn_id, chat_id, message_id)
     suppressed_deletions.add(key)
     asyncio.get_running_loop().call_later(120, suppressed_deletions.discard, key)
     try:
@@ -207,7 +207,7 @@ async def edit_or_replace(bot: Bot, message: Message, text: str) -> int:
     от имени владельца. Выбранный способ запоминается для подключения.
     """
     chat_id, conn_id = message.chat.id, message.business_connection_id
-    key = (chat_id, message.message_id)
+    key = (conn_id, chat_id, message.message_id)
     if _edit_ok.get(conn_id) is not False:
         suppressed_edits.add(key)
         try:
@@ -228,17 +228,18 @@ async def run_animation(bot: Bot, message: Message, frames: list[str], delay: fl
     """Проигрывает анимацию на сообщении владельца: "ok" | "busy" | "failed"."""
     chat_id = message.chat.id
     conn_id = message.business_connection_id
-    if chat_id in _active_chats:
+    chat_key = (conn_id, chat_id)
+    if chat_key in _active_chats:
         return "busy"
-    _active_chats.add(chat_id)
-    key = (chat_id, message.message_id)
+    _active_chats.add(chat_key)
+    key = (conn_id, chat_id, message.message_id)
     try:
         target_id = await edit_or_replace(bot, message, frames[0])
-        key = (chat_id, target_id)
+        key = (conn_id, chat_id, target_id)
         suppressed_edits.add(key)
         for frame in frames[1:]:
             await asyncio.sleep(delay)
-            if chat_id in _stop_requests:
+            if chat_key in _stop_requests:
                 break
             await _edit(bot, conn_id, chat_id, target_id, frame)
         return "ok"
@@ -246,7 +247,7 @@ async def run_animation(bot: Bot, message: Message, frames: list[str], delay: fl
         log.error("Анимация прервана: %s", e)
         return "failed"
     finally:
-        _active_chats.discard(chat_id)
-        _stop_requests.discard(chat_id)
+        _active_chats.discard(chat_key)
+        _stop_requests.discard(chat_key)
         # событие edited может прийти чуть позже последней правки
         asyncio.get_running_loop().call_later(5, suppressed_edits.discard, key)

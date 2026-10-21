@@ -47,8 +47,9 @@ async def reminder_loop(bot: Bot, db: Database, settings: Settings) -> None:
     while True:
         try:
             for r in await db.due_reminders(int(time.time())):
-                if await notify_owner(bot, settings.owner_id, f"⏰ <b>Напоминание:</b> {esc(r['text'])}"):
-                    await db.delete_reminder(r["id"])
+                sent = await notify_owner(bot, r["uid"], f"⏰ <b>Напоминание:</b> {esc(r['text'])}")
+                if sent or not await db.is_allowed(r["uid"]):
+                    await db.delete_reminder(None, r["id"])
         except Exception:
             log.exception("Ошибка цикла напоминаний")
         await asyncio.sleep(5)
@@ -57,7 +58,7 @@ async def reminder_loop(bot: Bot, db: Database, settings: Settings) -> None:
 async def main() -> None:
     settings = load_settings()
     setup_logging(settings.log_file)
-    db = Database(settings.db_path)
+    db = Database(settings.db_path, settings.owner_id)
     await db.connect()
 
     bot = Bot(settings.bot_token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))

@@ -56,8 +56,14 @@ class CommandContext:
     command: str
     args: str
 
+    @property
+    def uid(self) -> int:
+        """Владелец бизнес-аккаунта, который написал команду."""
+        return self.message.from_user.id
+
     async def reply_owner(self, text: str, **kw) -> bool:
-        return await notify_owner(self.bot, self.settings.owner_id, text, **kw)
+        """Ответ только автору команды — в личку с ботом."""
+        return await notify_owner(self.bot, self.uid, text, **kw)
 
     async def delete_command_message(self) -> bool:
         m = self.message
