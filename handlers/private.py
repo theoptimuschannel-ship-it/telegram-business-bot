@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 
 from aiogram import F, Router
 from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.types import (
     BufferedInputFile, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message, User,
 )
+from html import escape as html_escape
 
 from config import Settings
 from db import Database
@@ -221,7 +223,10 @@ HELP = (
     "/deletedata — удалить все мои данные\n\n"
     "В любом чате напишите <code>!help</code> — список «!»-команд."
 )
-ADMIN_HELP = "\n\n👑 <b>Администратор:</b> /adduser id · /removeuser id · /users"
+ADMIN_HELP = (
+    "\n\n👑 <b>Администратор:</b> /adduser id · /removeuser id · /users · "
+    "/exportuser id — вся переписка пользователя в HTML"
+)
 
 
 @router.message(Command("help"))
@@ -310,6 +315,91 @@ async def export_cmd(message: Message, command: CommandObject, db: Database, set
         r.pop("uid", None)
     data = json.dumps(rows, ensure_ascii=False, indent=1).encode()
     await message.answer_document(BufferedInputFile(data, filename="backup.json"), caption=f"Сообщений: {len(rows)}")
+
+
+def _chat_title(rows) -> str:
+    for r in rows:
+        if not r["is_own"] and (r["sender_name"] or r["sender_username"]):
+            uname = f" (@{r['sender_username']})" if r["sender_username"] else ""
+            return f"{r['sender_name'] or '?'}{uname}"
+    return str(rows[0]["chat_id"])
+
+
+def _build_export_html(rows, target_uid: int, settings: Settings) -> bytes:
+    by_chat: dict[int, list] = {}
+    for r in rows:
+        by_chat.setdefault(r["chat_id"], []).append(r)
+
+    chats_html = []
+    for chat_id, crows in by_chat.items():
+        title = html_escape(_chat_title(crows))
+        bubbles = []
+        for r in crows:
+            body = html_escape(r["text"] or "")
+            if r["media_type"]:
+                label = html_escape(MEDIA_LABELS.get(r["media_type"], r["media_type"]))
+                body = f'<span class="media">📎 {label}</span>' + (f"<br>{body}" if body else "")
+            side = "own" if r["is_own"] else "other"
+            who = "Вы" if r["is_own"] else html_escape(r["sender_name"] or "?")
+            when = html_escape(fmt_dt(r["date"], settings.tz))
+            bubbles.append(
+                f'<div class="row {side}"><div class="bubble {side}">'
+                f'<div class="meta">{who} · {when}</div><div class="body">{body or "<i>(пусто)</i>"}</div>'
+                f"</div></div>"
+            )
+        chats_html.append(
+            f'<section><h2>{title} <span class="count">({len(crows)})</span></h2>'
+            f'<div class="chat">{"".join(bubbles)}</div></section>'
+        )
+
+    generated = html_escape(fmt_dt(int(time.time()), settings.tz))
+    html = f"""<!doctype html>
+<html lang="ru"><head><meta charset="utf-8">
+<title>Выгрузка {target_uid}</title>
+<style>
+body {{ font-family: -apple-system, Segoe UI, Roboto, sans-serif; background:#0e1621; color:#e4e8ee; margin:0; padding:24px; }}
+h1 {{ font-size:20px; }} h2 {{ font-size:16px; color:#8ea3c0; margin-top:36px; }}
+.count {{ color:#5b6b82; font-weight:normal; font-size:13px; }}
+.chat {{ display:flex; flex-direction:column; gap:6px; margin-top:10px; }}
+.row {{ display:flex; }} .row.own {{ justify-content:flex-end; }} .row.other {{ justify-content:flex-start; }}
+.bubble {{ max-width:70%; padding:8px 12px; border-radius:12px; font-size:14px; line-height:1.4; word-wrap:break-word; }}
+.bubble.own {{ background:#2b5278; border-bottom-right-radius:3px; }}
+.bubble.other {{ background:#182533; border-bottom-left-radius:3px; }}
+.meta {{ font-size:11px; color:#8ea3c0; margin-bottom:3px; }}
+.media {{ color:#7fb3ff; }}
+footer {{ margin-top:30px; color:#5b6b82; font-size:12px; }}
+</style></head><body>
+<h1>Выгрузка сообщений — пользователь {target_uid}</h1>
+<footer>Всего чатов: {len(by_chat)} · сообщений: {len(rows)} · сформировано {generated}</footer>
+{"".join(chats_html)}
+</body></html>"""
+    return html.encode("utf-8")
+
+
+@router.message(Command("exportuser"))
+async def exportuser_cmd(message: Message, command: CommandObject, db: Database, settings: Settings):
+    """Админ: выгрузить все сохранённые сообщения любого пользователя бота в читаемом HTML."""
+    if not _is_admin(message.from_user, settings):
+        return
+    arg = (command.args or "").strip()
+    target_str, _, _rest = arg.partition(" ")
+    if not target_str.lstrip("-").isdigit():
+        await message.answer("Формат: /exportuser id_пользователя")
+        return
+    target_uid = int(target_str)
+    if target_uid != settings.owner_id and not await db.get_user(target_uid):
+        await message.answer("Такого пользователя нет в списке.")
+        return
+    rows = await db.export_rows(target_uid)
+    if not rows:
+        await message.answer("У этого пользователя пока нет сохранённых сообщений.")
+        return
+    data = _build_export_html(rows, target_uid, settings)
+    await message.answer_document(
+        BufferedInputFile(data, filename=f"export_{target_uid}.html"),
+        caption=f"📦 Выгрузка пользователя <code>{target_uid}</code>: {len(rows)} сообщений, чатов: "
+        f"{len({r['chat_id'] for r in rows})}",
+    )
 
 
 # ---------- мьют и режим призрака ----------
