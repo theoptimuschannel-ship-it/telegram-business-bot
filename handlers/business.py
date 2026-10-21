@@ -1,0 +1,237 @@
+from __future__ import annotations
+
+import asyncio
+import logging
+
+from aiogram import Bot, Router
+from aiogram.exceptions import TelegramAPIError, TelegramRetryAfter
+from aiogram.types import BusinessConnection, BusinessMessagesDeleted, Message
+
+import animations
+from config import Settings
+from db import Database
+from handlers.auto import maybe_autoreply
+from handlers.commands import dispatch
+from handlers.utils import clip, esc, fmt_dt, notify_owner
+
+log = logging.getLogger(__name__)
+router = Router(name="business")
+
+RIGHTS_LABELS = {
+    "can_reply": "отвечать на сообщения",
+    "can_read_messages": "читать сообщения",
+    "can_delete_sent_messages": "удалять отправленные сообщения",
+    "can_delete_outgoing_messages": "удалять исходящие сообщения",
+    "can_delete_all_messages": "удалять любые сообщения",
+    "can_edit_name": "менять имя",
+    "can_edit_bio": "менять описание",
+    "can_edit_profile_photo": "менять фото профиля",
+    "can_edit_username": "менять username",
+    "can_change_gift_settings": "настройки подарков",
+    "can_view_gifts_and_stars": "видеть подарки и звёзды",
+    "can_convert_gifts_to_stars": "конвертировать подарки в звёзды",
+    "can_transfer_and_upgrade_gifts": "передавать и улучшать подарки",
+    "can_transfer_stars": "переводить звёзды",
+    "can_manage_stories": "управлять историями",
+}
+
+MEDIA_LABELS = {
+    "photo": "фото", "video": "видео", "document": "файл", "audio": "аудио", "voice": "голосовое",
+    "video_note": "кружок", "animation": "GIF", "sticker": "стикер",
+}
+# media_type -> (метод отправки, имя параметра)
+MEDIA_SEND = {k: (f"send_{k}", k) for k in MEDIA_LABELS}
+NO_CAPTION = {"video_note", "sticker"}
+
+
+def format_rights(rights: dict) -> str:
+    if not rights:
+        return "—"
+    return "\n".join(
+        f"{'✅' if rights.get(k) else '❌'} {label}" for k, label in RIGHTS_LABELS.items() if k in rights
+    ) or "—"
+
+
+def extract_media(m: Message) -> tuple[str | None, str | None]:
+    if m.photo:
+        return "photo", m.photo[-1].file_id
+    for kind in ("video", "document", "audio", "voice", "video_note", "animation", "sticker"):
+        obj = getattr(m, kind, None)
+        if obj:
+            return kind, obj.file_id
+    return None, None
+
+
+def to_record(m: Message, settings: Settings) -> dict:
+    u = m.from_user
+    media_type, file_id = extract_media(m)
+    return {
+        "chat_id": m.chat.id,
+        "message_id": m.message_id,
+        "connection_id": m.business_connection_id,
+        "sender_id": u.id if u else None,
+        "sender_name": u.full_name if u else m.chat.full_name,
+        "sender_username": u.username if u else None,
+        "date": int(m.date.timestamp()),
+        "text": m.text or m.caption,
+        "media_type": media_type,
+        "file_id": file_id,
+        "reply_to": m.reply_to_message.message_id if m.reply_to_message else None,
+        "is_own": int(bool(u and u.id == settings.owner_id)),
+    }
+
+
+async def store_connection(db: Database, bc: BusinessConnection) -> dict:
+    rights = bc.rights.model_dump(exclude_none=True) if getattr(bc, "rights", None) else {}
+    if not rights and getattr(bc, "can_reply", None) is not None:
+        rights = {"can_reply": bc.can_reply}
+    await db.upsert_connection(bc.id, bc.user.id, bc.user_chat_id, bc.is_enabled, rights)
+    return rights
+
+
+async def is_owner_connection(bot: Bot, db: Database, settings: Settings, conn_id: str | None) -> bool:
+    if not conn_id:
+        return False
+    row = await db.get_connection(conn_id)
+    if row:
+        return row["user_id"] == settings.owner_id
+    try:
+        bc = await bot.get_business_connection(conn_id)
+    except TelegramAPIError as e:
+        log.warning("get_business_connection(%s) не удался: %s", conn_id, e)
+        return False
+    if bc.user.id != settings.owner_id:
+        return False
+    await store_connection(db, bc)
+    return True
+
+
+# ---------- подключение ----------
+@router.business_connection()
+async def on_connection(bc: BusinessConnection, bot: Bot, db: Database, settings: Settings):
+    if bc.user.id != settings.owner_id:
+        log.info("Игнорирую подключение чужого аккаунта %s", bc.user.id)
+        return
+    rights = await store_connection(db, bc)
+    if bc.is_enabled:
+        text = f"✅ <b>Бот подключён</b> к аккаунту.\n\nПрава:\n{format_rights(rights)}"
+        if not rights.get("can_read_messages"):
+            text += "\n\n⚠️ Без права «читать сообщения» бэкап работать не будет."
+    else:
+        text = "❌ <b>Бот отключён</b> от аккаунта."
+    await notify_owner(bot, settings.owner_id, text)
+
+
+# ---------- новые сообщения ----------
+@router.business_message()
+async def on_message(message: Message, bot: Bot, db: Database, settings: Settings):
+    if not await is_owner_connection(bot, db, settings, message.business_connection_id):
+        return
+    rec = to_record(message, settings)
+    try:
+        await db.save_message(rec)
+    except Exception:
+        log.exception("Не удалось сохранить сообщение")
+    if rec["is_own"]:
+        if message.chat.type == "private" and (message.text or "").startswith("!"):
+            await dispatch(bot, db, settings, message)
+    else:
+        try:
+            await maybe_autoreply(bot, db, settings, message)
+        except Exception:
+            log.exception("Ошибка автоответа")
+
+
+# ---------- изменённые ----------
+@router.edited_business_message()
+async def on_edited(message: Message, bot: Bot, db: Database, settings: Settings):
+    if not await is_owner_connection(bot, db, settings, message.business_connection_id):
+        return
+    if (message.chat.id, message.message_id) in animations.suppressed_edits:
+        return
+    old = await db.get_message(message.chat.id, message.message_id)
+    rec = to_record(message, settings)
+    await db.save_message(rec)
+
+    old_text = old["text"] if old else None
+    if old and (old_text or "") == (rec["text"] or "") and old["media_type"] == rec["media_type"]:
+        return
+    await db.incr("stat_edited")
+    if not await db.get_bool("notify_edited") or await db.is_muted(message.chat.id):
+        return
+    if rec["is_own"] and not await db.get_bool("notify_own"):
+        return
+    name = esc(rec["sender_name"] or "?")
+    new = esc(clip(rec["text"] or f"[{MEDIA_LABELS.get(rec['media_type'], 'без текста')}]", 1800))
+    if old:
+        was = esc(clip(old_text or f"[{MEDIA_LABELS.get(old['media_type'], 'без текста')}]", 1800))
+        text = f"✏️ <b>{name}</b> изменил сообщение:\n<b>было:</b> {was}\n<b>→ стало:</b> {new}"
+    else:
+        text = f"✏️ <b>{name}</b> изменил сообщение (старой версии нет в бэкапе):\n<b>стало:</b> {new}"
+    await notify_owner(bot, settings.owner_id, text)
+
+
+# ---------- удалённые ----------
+async def resend_media(bot: Bot, owner_id: int, media_type: str, file_id: str, caption: str | None) -> bool:
+    method, param = MEDIA_SEND[media_type]
+    kwargs = {"chat_id": owner_id, param: file_id}
+    if caption and media_type not in NO_CAPTION:
+        kwargs["caption"] = caption
+    for _ in range(3):
+        try:
+            await getattr(bot, method)(**kwargs)
+            return True
+        except TelegramRetryAfter as e:
+            await asyncio.sleep(e.retry_after + 0.5)
+        except TelegramAPIError as e:
+            log.warning("Не удалось переотправить %s: %s", media_type, e)
+            return False
+    return False
+
+
+@router.deleted_business_messages()
+async def on_deleted(event: BusinessMessagesDeleted, bot: Bot, db: Database, settings: Settings):
+    if not await is_owner_connection(bot, db, settings, event.business_connection_id):
+        return
+    chat_id = event.chat.id
+    rows = await db.get_messages(chat_id, list(event.message_ids))
+    found = {r["message_id"] for r in rows}
+    ids = [i for i in event.message_ids if (chat_id, i) not in animations.suppressed_deletions]
+    rows = [r for r in rows if r["message_id"] in ids]
+    missing = [i for i in ids if i not in found]
+    if not rows and not missing:
+        return
+    await db.incr("stat_deleted", len(rows))
+
+    if not await db.get_bool("notify_deleted") or await db.is_muted(chat_id):
+        return
+    notify_own = await db.get_bool("notify_own")
+    owner = settings.owner_id
+    for r in rows:
+        if r["is_own"] and not notify_own:
+            continue
+        name = esc(r["sender_name"] or "?")
+        when = fmt_dt(r["date"], settings.tz)
+        mt = r["media_type"]
+        body = r["text"] or ("" if mt else "[без текста]")
+        header = f"🗑 <b>{name}</b> удалил сообщение ({when}):"
+        if not mt:
+            await notify_owner(bot, owner, f"{header}\n{esc(clip(body))}")
+            continue
+        label = MEDIA_LABELS.get(mt, mt)
+        caption = f"{header}\n[{label}] {esc(body)}".strip()
+        inline = mt not in NO_CAPTION and len(caption) <= 1024
+        ok = await resend_media(bot, owner, mt, r["file_id"], caption if inline else None)
+        if ok and not inline:
+            await notify_owner(bot, owner, f"{header}\n[{label}] {esc(clip(body))}")
+        elif not ok:
+            await notify_owner(
+                bot, owner,
+                f"{header}\n[{label}] {esc(clip(body))}\n⚠️ Не удалось переотправить медиа: file_id больше не работает.",
+            )
+    if missing:
+        await notify_owner(
+            bot, owner,
+            f"🗑 В чате с <b>{esc(event.chat.full_name or str(chat_id))}</b> удалено сообщений, "
+            f"которых нет в бэкапе: {len(missing)}",
+        )
