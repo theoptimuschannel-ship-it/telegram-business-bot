@@ -80,6 +80,7 @@ DEFAULT_SETTINGS = {
     "notify_deleted": "1",
     "notify_edited": "1",
     "notify_own": "0",
+    "save_replied_media": "1",
     "ghost": "0",
     "away_enabled": "0",
     "away_text": "Привет! Сейчас я не на связи, отвечу позже.",

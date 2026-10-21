@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import logging
 
 from aiogram import Bot, Router
 from aiogram.exceptions import TelegramAPIError, TelegramRetryAfter
-from aiogram.types import BusinessConnection, BusinessMessagesDeleted, Message
+from aiogram.types import BufferedInputFile, BusinessConnection, BusinessMessagesDeleted, Message
 
 import animations
 from config import Settings
@@ -130,6 +131,57 @@ async def on_connection(bc: BusinessConnection, bot: Bot, db: Database, settings
     await notify_owner(bot, uid, text)
 
 
+# ---------- медиа «по ответу» (в т.ч. одноразовое 🔥) ----------
+_saved_replies: set[tuple[int, int, int]] = set()
+REPLY_MEDIA = ("photo", "video", "voice", "video_note", "animation", "audio", "document")
+
+
+async def save_replied_media(bot: Bot, db: Database, settings: Settings, message: Message, uid: int) -> None:
+    """Владелец ответил на чужое медиа — присылаем это медиа ему в бота."""
+    r = message.reply_to_message
+    if not r or (r.from_user and r.from_user.id == uid):
+        return
+    media_type, file_id = extract_media(r)
+    if media_type not in REPLY_MEDIA or not file_id:
+        return
+    if not await db.get_bool(uid, "save_replied_media"):
+        return
+    key = (uid, message.chat.id, r.message_id)
+    if key in _saved_replies:
+        return
+    if len(_saved_replies) > 5000:
+        _saved_replies.clear()
+    _saved_replies.add(key)
+
+    name = (r.from_user.full_name if r.from_user else None) or message.chat.full_name or "?"
+    when = fmt_dt(int(r.date.timestamp()), settings.tz)
+    caption = f"🔥 <b>{esc(name)}</b> · {when}\nМедиа, на которое вы ответили"
+    if r.caption:
+        caption += f"\n{esc(clip(r.caption, 700))}"
+    if media_type in NO_CAPTION:
+        await notify_owner(bot, uid, caption)
+    sent = await resend_media(bot, uid, media_type, file_id, caption)
+    if not sent:  # запасной путь: скачать и загрузить заново
+        try:
+            buf = io.BytesIO()
+            await bot.download(file_id, destination=buf)
+            method, param = MEDIA_SEND[media_type]
+            kwargs = {"chat_id": uid, param: BufferedInputFile(buf.getvalue(), filename=f"{media_type}")}
+            if media_type not in NO_CAPTION:
+                kwargs["caption"] = caption
+            await getattr(bot, method)(**kwargs)
+            sent = True
+        except Exception as e:
+            log.warning("Не удалось сохранить медиа из ответа: %s", e)
+    if not sent:
+        _saved_replies.discard(key)
+        await notify_owner(
+            bot, uid,
+            f"⚠️ Не удалось выгрузить {MEDIA_LABELS.get(media_type, media_type)} от <b>{esc(name)}</b>: "
+            "Telegram не отдал файл боту.",
+        )
+
+
 # ---------- новые сообщения ----------
 @router.business_message()
 async def on_message(message: Message, bot: Bot, db: Database, settings: Settings):
@@ -142,6 +194,11 @@ async def on_message(message: Message, bot: Bot, db: Database, settings: Setting
     except Exception:
         log.exception("Не удалось сохранить сообщение")
     if rec["is_own"]:
+        if message.reply_to_message:
+            try:
+                await save_replied_media(bot, db, settings, message, uid)
+            except Exception:
+                log.exception("Ошибка сохранения медиа из ответа")
         if message.chat.type == "private" and (message.text or "").startswith("!"):
             await dispatch(bot, db, settings, message)
     else:
