@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import io
 import json
 import logging
 import time
+import zipfile
 
 from aiogram import F, Router
 from aiogram.filters import Command, CommandObject, CommandStart
@@ -225,7 +227,7 @@ HELP = (
 )
 ADMIN_HELP = (
     "\n\n👑 <b>Администратор:</b> /adduser id · /removeuser id · /users · "
-    "/exportuser id — вся переписка пользователя в HTML"
+    "/exportuser id — вся переписка пользователя архивом (HTML + файлы)"
 )
 
 
@@ -325,7 +327,38 @@ def _chat_title(rows) -> str:
     return str(rows[0]["chat_id"])
 
 
-def _build_export_html(rows, target_uid: int, settings: Settings) -> bytes:
+MEDIA_EXT = {
+    "photo": "jpg", "video": "mp4", "video_note": "mp4", "voice": "ogg",
+    "audio": "mp3", "animation": "mp4", "document": "bin", "sticker": "webp",
+}
+MEDIA_TAG = {  # media_type -> способ встроить файл в html (img/video/audio/иное)
+    "photo": "img", "sticker": "img",
+    "video": "video", "video_note": "video", "animation": "video",
+    "voice": "audio", "audio": "audio",
+}
+
+
+async def _collect_media(message: Message, rows) -> dict[tuple[int, int], str | None]:
+    """Скачивает медиа всех сообщений с файлами; ключ -> относительный путь в архиве или None, если не вышло."""
+    media_map: dict[tuple[int, int], str | None] = {}
+    bot = message.bot
+    for r in rows:
+        if not r["media_type"] or not r["file_id"]:
+            continue
+        key = (r["chat_id"], r["message_id"])
+        ext = MEDIA_EXT.get(r["media_type"], "bin")
+        rel_path = f"media/{r['chat_id']}_{r['message_id']}.{ext}"
+        try:
+            buf = io.BytesIO()
+            await bot.download(r["file_id"], destination=buf)
+            media_map[key] = (rel_path, buf.getvalue())
+        except Exception as e:
+            log.info("Не удалось скачать медиа %s для экспорта: %s", r["file_id"], e)
+            media_map[key] = None
+    return media_map
+
+
+def _build_export_html(rows, target_uid: int, settings: Settings, media_map: dict) -> bytes:
     by_chat: dict[int, list] = {}
     for r in rows:
         by_chat.setdefault(r["chat_id"], []).append(r)
@@ -338,7 +371,21 @@ def _build_export_html(rows, target_uid: int, settings: Settings) -> bytes:
             body = html_escape(r["text"] or "")
             if r["media_type"]:
                 label = html_escape(MEDIA_LABELS.get(r["media_type"], r["media_type"]))
-                body = f'<span class="media">📎 {label}</span>' + (f"<br>{body}" if body else "")
+                entry = media_map.get((r["chat_id"], r["message_id"]))
+                if entry:
+                    rel_path = html_escape(entry[0])
+                    tag = MEDIA_TAG.get(r["media_type"])
+                    if tag == "img":
+                        media_html = f'<a href="{rel_path}" target="_blank"><img class="media-img" src="{rel_path}"></a>'
+                    elif tag == "video":
+                        media_html = f'<video class="media-video" controls src="{rel_path}"></video>'
+                    elif tag == "audio":
+                        media_html = f'<audio controls src="{rel_path}"></audio>'
+                    else:
+                        media_html = f'<a class="media-file" href="{rel_path}">📎 скачать «{label}»</a>'
+                else:
+                    media_html = f'<span class="media-missing">📎 {label} (файл недоступен для скачивания)</span>'
+                body = media_html + (f"<br>{body}" if body else "")
             side = "own" if r["is_own"] else "other"
             who = "Вы" if r["is_own"] else html_escape(r["sender_name"] or "?")
             when = html_escape(fmt_dt(r["date"], settings.tz))
@@ -366,7 +413,11 @@ h1 {{ font-size:20px; }} h2 {{ font-size:16px; color:#8ea3c0; margin-top:36px; }
 .bubble.own {{ background:#2b5278; border-bottom-right-radius:3px; }}
 .bubble.other {{ background:#182533; border-bottom-left-radius:3px; }}
 .meta {{ font-size:11px; color:#8ea3c0; margin-bottom:3px; }}
-.media {{ color:#7fb3ff; }}
+.media-missing {{ color:#e09a4a; }}
+.media-img {{ max-width:280px; max-height:320px; border-radius:8px; display:block; }}
+.media-video {{ max-width:280px; max-height:320px; border-radius:8px; display:block; }}
+.media-file {{ color:#7fb3ff; }}
+audio {{ max-width:280px; }}
 footer {{ margin-top:30px; color:#5b6b82; font-size:12px; }}
 </style></head><body>
 <h1>Выгрузка сообщений — пользователь {target_uid}</h1>
@@ -378,7 +429,7 @@ footer {{ margin-top:30px; color:#5b6b82; font-size:12px; }}
 
 @router.message(Command("exportuser"))
 async def exportuser_cmd(message: Message, command: CommandObject, db: Database, settings: Settings):
-    """Админ: выгрузить все сохранённые сообщения любого пользователя бота в читаемом HTML."""
+    """Админ: выгрузить все сохранённые сообщения любого пользователя бота — в HTML + все файлы, архивом."""
     if not _is_admin(message.from_user, settings):
         return
     arg = (command.args or "").strip()
@@ -394,11 +445,35 @@ async def exportuser_cmd(message: Message, command: CommandObject, db: Database,
     if not rows:
         await message.answer("У этого пользователя пока нет сохранённых сообщений.")
         return
-    data = _build_export_html(rows, target_uid, settings)
+    media_count = sum(1 for r in rows if r["media_type"] and r["file_id"])
+    status = await message.answer(
+        f"⏳ Собираю выгрузку: {len(rows)} сообщений" + (f", скачиваю {media_count} файлов…" if media_count else "…")
+    )
+    media_map = await _collect_media(message, rows)
+    html_data = _build_export_html(rows, target_uid, settings, media_map)
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("index.html", html_data)
+        for entry in media_map.values():
+            if entry:
+                rel_path, content = entry
+                zf.writestr(rel_path, content)
+    buf.seek(0)
+
+    missing = sum(1 for v in media_map.values() if v is None)
+    caption = (
+        f"📦 Выгрузка пользователя <code>{target_uid}</code>: {len(rows)} сообщений, чатов: "
+        f"{len({r['chat_id'] for r in rows})}, файлов в архиве: {media_count - missing}"
+    )
+    if missing:
+        caption += f"\n⚠️ Не удалось скачать: {missing}"
+    try:
+        await status.delete()
+    except Exception:
+        pass
     await message.answer_document(
-        BufferedInputFile(data, filename=f"export_{target_uid}.html"),
-        caption=f"📦 Выгрузка пользователя <code>{target_uid}</code>: {len(rows)} сообщений, чатов: "
-        f"{len({r['chat_id'] for r in rows})}",
+        BufferedInputFile(buf.getvalue(), filename=f"export_{target_uid}.zip"), caption=caption
     )
 
 
