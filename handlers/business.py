@@ -143,6 +143,8 @@ async def save_replied_media(bot: Bot, db: Database, settings: Settings, message
         return
     media_type, file_id = extract_media(r)
     if media_type not in REPLY_MEDIA or not file_id:
+        present = [k for k, v in r.model_dump(exclude_none=True).items() if v not in (None, [], {}, False)]
+        log.info("Ответ на сообщение без доступного медиа (одноразовое?). Поля: %s", present)
         return
     if not await db.get_bool(uid, "save_replied_media"):
         return
