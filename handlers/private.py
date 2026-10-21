@@ -26,19 +26,6 @@ TOGGLES = {
 }
 
 
-def consent_text(settings: Settings) -> str:
-    return (
-        "🔐 <b>Условия использования</b>\n\n"
-        "Чтобы бот работал, он сохраняет ваши сообщения (текст, подписи, ссылки на файлы) в базе на сервере. "
-        "Администратор бота управляет этим сервером и <b>технически может получить доступ к базе</b>. "
-        "Другие пользователи бота ваших данных не видят.\n\n"
-        f"• Сообщения хранятся {settings.retention_days} дн., потом удаляются.\n"
-        "• /deletedata — удалить все ваши данные в любой момент.\n"
-        "• Отключить бота можно в «Настройки → Telegram для бизнеса → Чат-боты».\n\n"
-        "Соглашайтесь, только если доверяете администратору бота."
-    )
-
-
 async def _gate(message: Message, db: Database) -> int | None:
     """Telegram ID, если пользователю разрешено пользоваться ботом; иначе молча None."""
     u = message.from_user
@@ -56,18 +43,15 @@ async def start(message: Message, db: Database, settings: Settings):
     if not u:
         return
     if not await db.is_allowed(u.id):
-        row = await db.get_user(u.id)
-        if row:  # добавлен администратором — нужно согласие
-            kb = InlineKeyboardMarkup(
-                inline_keyboard=[[InlineKeyboardButton(text="✅ Согласен, включить", callback_data="consent:yes")]]
-            )
-            await message.answer(consent_text(settings), reply_markup=kb)
+        if await db.get_user(u.id):  # добавлен администратором — активируем
+            await db.accept_user(u.id, u.full_name, u.username)
+            await message.answer("✅ Доступ активирован.")
         else:
             await message.answer(
                 "🔒 Доступ закрыт. Попросите администратора бота добавить ваш ID: "
                 f"<code>{u.id}</code>"
             )
-        return
+            return
     conns = await db.list_connections(u.id)
     if not conns:
         await message.answer(
@@ -81,22 +65,6 @@ async def start(message: Message, db: Database, settings: Settings):
         parts.append(f"\n{state} (обновлено {fmt_dt(c['updated_at'], settings.tz)})\n{format_rights(json.loads(c['rights']))}")
     parts.append("\n/help — все команды, «!help» в любом чате — «!»-команды")
     await message.answer("\n".join(parts))
-
-
-@router.callback_query(F.data == "consent:yes")
-async def consent(cb: CallbackQuery, db: Database, settings: Settings):
-    u = cb.from_user
-    row = await db.get_user(u.id)
-    if not row:
-        await cb.answer("Доступ не выдан", show_alert=True)
-        return
-    await db.accept_user(u.id, u.full_name, u.username)
-    await cb.answer("Готово")
-    if cb.message:
-        await cb.message.answer(
-            "✅ Доступ активирован.\nТеперь подключите бота: Настройки → Telegram для бизнеса → Чат-боты "
-            "(права: читать, отвечать, удалять сообщения). Если вы уже подключали — всё заработает само.\n\n/help — команды"
-        )
 
 
 # ---------- администратор ----------
@@ -121,7 +89,7 @@ async def adduser(message: Message, command: CommandObject, db: Database, settin
     added = await db.add_user(uid)
     await message.answer(
         ("✅ Добавлен: " if added else "ℹ️ Уже в списке: ")
-        + f"<code>{uid}</code>\nПусть откроет бота, нажмёт /start и примет условия — после этого доступ включится."
+        + f"<code>{uid}</code>\nПусть откроет бота и нажмёт /start — после этого доступ включится."
     )
 
 
@@ -146,7 +114,7 @@ async def users_cmd(message: Message, db: Database, settings: Settings):
     rows = await db.list_users()
     lines = [f"👑 <code>{settings.owner_id}</code> (вы) — сообщений: {await db.count_messages(settings.owner_id)}"]
     for r in rows:
-        who = esc(r["name"] or "ещё не принял условия")
+        who = esc(r["name"] or "ещё не нажал /start")
         uname = f" @{r['username']}" if r["username"] else ""
         state = "✅" if r["accepted"] else "⏳"
         lines.append(f"{state} <code>{r['user_id']}</code> {who}{uname} — сообщений: {await db.count_messages(r['user_id'])}")

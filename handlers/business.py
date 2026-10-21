@@ -114,10 +114,10 @@ async def on_connection(bc: BusinessConnection, bot: Bot, db: Database, settings
     uid = bc.user.id
     if not await db.is_allowed(uid):
         log.info("Игнорирую подключение неразрешённого аккаунта %s", uid)
-        if await db.get_user(uid):  # добавлен владельцем, но ещё не принял условия
+        if await db.get_user(uid):  # добавлен владельцем, но ещё не нажал /start
             await notify_owner(
                 bot, bc.user_chat_id,
-                "👋 Вас добавили в бота, но доступ ещё не активирован. Откройте бота, нажмите /start и примите условия.",
+                "👋 Вас добавили в бота, но доступ ещё не активирован. Откройте бота и нажмите /start.",
             )
         return
     rights = await store_connection(db, bc)
