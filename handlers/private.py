@@ -452,14 +452,18 @@ async def exportuser_cmd(message: Message, command: CommandObject, db: Database,
     media_map = await _collect_media(message, rows)
     html_data = _build_export_html(rows, target_uid, settings, media_map)
 
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-        zf.writestr("index.html", html_data)
-        for entry in media_map.values():
-            if entry:
-                rel_path, content = entry
-                zf.writestr(rel_path, content)
-    buf.seek(0)
+    # Лимит Telegram на загрузку ботом — 50 МБ, поэтому режем на части (index.html — в первой)
+    limit = 45 * 1024 * 1024
+    parts: list[list[tuple[str, bytes]]] = [[("index.html", html_data)]]
+    size = len(html_data)
+    for entry in media_map.values():
+        if not entry:
+            continue
+        if size + len(entry[1]) > limit and parts[-1]:
+            parts.append([])
+            size = 0
+        parts[-1].append(entry)
+        size += len(entry[1])
 
     missing = sum(1 for v in media_map.values() if v is None)
     caption = (
@@ -468,13 +472,27 @@ async def exportuser_cmd(message: Message, command: CommandObject, db: Database,
     )
     if missing:
         caption += f"\n⚠️ Не удалось скачать: {missing}"
+    if len(parts) > 1:
+        caption += f"\n📚 Архив из {len(parts)} частей — распакуйте все в одну папку, откройте index.html"
+    try:
+        for i, files in enumerate(parts, 1):
+            buf = io.BytesIO()
+            with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+                for name, content in files:
+                    zf.writestr(name, content)
+            suffix = f"_part{i}" if len(parts) > 1 else ""
+            await message.answer_document(
+                BufferedInputFile(buf.getvalue(), filename=f"export_{target_uid}{suffix}.zip"),
+                caption=caption if i == 1 else f"Часть {i}/{len(parts)}",
+            )
+    except Exception as e:
+        log.exception("Не удалось отправить выгрузку")
+        await message.answer(f"❌ Не удалось отправить архив: {e}")
+        return
     try:
         await status.delete()
     except Exception:
         pass
-    await message.answer_document(
-        BufferedInputFile(buf.getvalue(), filename=f"export_{target_uid}.zip"), caption=caption
-    )
 
 
 # ---------- мьют и режим призрака ----------
