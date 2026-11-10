@@ -228,7 +228,8 @@ HELP = (
 )
 ADMIN_HELP = (
     "\n\n👑 <b>Администратор:</b> /adduser id · /removeuser id · /users · "
-    "/exportuser id — вся переписка пользователя архивом (HTML + файлы)"
+    "/exportuser id — вся переписка пользователя архивом (HTML + файлы) · "
+    "/exportlastuser id — то же, но медиафайлы только последние 300"
 )
 
 
@@ -353,7 +354,7 @@ async def _collect_media(message: Message, rows, status_msg: Message | None = No
         rel_path = f"media/{r['chat_id']}_{r['message_id']}.{ext}"
         try:
             buf = io.BytesIO()
-            await asyncio.wait_for(bot.download(r["file_id"], destination=buf), timeout=20)
+            await bot.download(r["file_id"], destination=buf)
             media_map[key] = (rel_path, buf.getvalue())
         except Exception as e:
             log.info("Не удалось скачать медиа %s для экспорта: %s", r["file_id"], e)
@@ -497,6 +498,88 @@ async def exportuser_cmd(message: Message, command: CommandObject, db: Database,
             suffix = f"_part{i}" if len(parts) > 1 else ""
             await message.answer_document(
                 BufferedInputFile(buf.getvalue(), filename=f"export_{target_uid}{suffix}.zip"),
+                caption=caption if i == 1 else f"Часть {i}/{len(parts)}",
+            )
+    except Exception as e:
+        log.exception("Не удалось отправить выгрузку")
+        await message.answer(f"❌ Не удалось отправить архив: {e}")
+        return
+    try:
+        await status.delete()
+    except Exception:
+        pass
+
+
+@router.message(Command("exportlastuser"))
+async def exportlastuser_cmd(message: Message, command: CommandObject, db: Database, settings: Settings):
+    """Админ: выгрузить все сообщения пользователя, но медиафайлы только последние 300."""
+    if not _is_admin(message.from_user, settings):
+        return
+    arg = (command.args or "").strip()
+    target_str, _, _rest = arg.partition(" ")
+    if not target_str.lstrip("-").isdigit():
+        await message.answer("Формат: /exportlastuser id_пользователя")
+        return
+    target_uid = int(target_str)
+    if target_uid != settings.owner_id and not await db.get_user(target_uid):
+        await message.answer("Такого пользователя нет в списке.")
+        return
+    rows = await db.export_rows(target_uid)
+    if not rows:
+        await message.answer("У этого пользователя пока нет сохранённых сообщений.")
+        return
+
+    # Оставляем только последние 300 медиафайлов для скачивания
+    MEDIA_LIMIT = 300
+    media_rows_all = [r for r in rows if r["media_type"] and r["file_id"]]
+    allowed_keys = {(r["chat_id"], r["message_id"]) for r in media_rows_all[-MEDIA_LIMIT:]}
+    rows_limited = [
+        r if (r["chat_id"], r["message_id"]) not in allowed_keys or not r["media_type"]
+        else r
+        for r in rows
+    ]
+    media_count = len(allowed_keys)
+
+    status = await message.answer(
+        f"⏳ Собираю выгрузку: {len(rows)} сообщений"
+        + (f", скачиваю {media_count} файлов (последние {MEDIA_LIMIT})…" if media_count else "…")
+    )
+
+    # Скачиваем только разрешённые медиафайлы
+    media_map = await _collect_media(message, [r for r in rows if (r["chat_id"], r["message_id"]) in allowed_keys], status_msg=status)
+    html_data = _build_export_html(rows, target_uid, settings, media_map)
+
+    limit = 45 * 1024 * 1024
+    parts: list[list[tuple[str, bytes]]] = [[("index.html", html_data)]]
+    size = len(html_data)
+    for entry in media_map.values():
+        if not entry:
+            continue
+        if size + len(entry[1]) > limit and parts[-1]:
+            parts.append([])
+            size = 0
+        parts[-1].append(entry)
+        size += len(entry[1])
+
+    missing = sum(1 for v in media_map.values() if v is None)
+    caption = (
+        f"📦 Выгрузка пользователя <code>{target_uid}</code>: {len(rows)} сообщений, чатов: "
+        f"{len({r['chat_id'] for r in rows})}, файлов в архиве: {media_count - missing}"
+        f"\n⚠️ Медиа только последние {MEDIA_LIMIT} из {len(media_rows_all)}"
+    )
+    if missing:
+        caption += f"\n⚠️ Не удалось скачать: {missing}"
+    if len(parts) > 1:
+        caption += f"\n📚 Архив из {len(parts)} частей — распакуйте все в одну папку, откройте index.html"
+    try:
+        for i, files in enumerate(parts, 1):
+            buf = io.BytesIO()
+            with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+                for name, content in files:
+                    zf.writestr(name, content)
+            suffix = f"_part{i}" if len(parts) > 1 else ""
+            await message.answer_document(
+                BufferedInputFile(buf.getvalue(), filename=f"export_{target_uid}_last{MEDIA_LIMIT}{suffix}.zip"),
                 caption=caption if i == 1 else f"Часть {i}/{len(parts)}",
             )
     except Exception as e:
