@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import io
 import json
 import logging
@@ -338,23 +339,36 @@ MEDIA_TAG = {  # media_type -> способ встроить файл в html (i
 }
 
 
-async def _collect_media(message: Message, rows) -> dict[tuple[int, int], str | None]:
+async def _collect_media(message: Message, rows, status_msg: Message | None = None) -> dict[tuple[int, int], str | None]:
     """Скачивает медиа всех сообщений с файлами; ключ -> относительный путь в архиве или None, если не вышло."""
     media_map: dict[tuple[int, int], str | None] = {}
     bot = message.bot
-    for r in rows:
-        if not r["media_type"] or not r["file_id"]:
-            continue
+    media_rows = [r for r in rows if r["media_type"] and r["file_id"]]
+    total = len(media_rows)
+    done = 0
+    failed = 0
+    for r in media_rows:
         key = (r["chat_id"], r["message_id"])
         ext = MEDIA_EXT.get(r["media_type"], "bin")
         rel_path = f"media/{r['chat_id']}_{r['message_id']}.{ext}"
         try:
             buf = io.BytesIO()
-            await bot.download(r["file_id"], destination=buf)
+            await asyncio.wait_for(bot.download(r["file_id"], destination=buf), timeout=20)
             media_map[key] = (rel_path, buf.getvalue())
         except Exception as e:
             log.info("Не удалось скачать медиа %s для экспорта: %s", r["file_id"], e)
             media_map[key] = None
+            failed += 1
+        done += 1
+        if status_msg and done % 50 == 0:
+            try:
+                await status_msg.edit_text(
+                    f"⏳ Скачиваю файлы: {done}/{total}"
+                    + (f" (не удалось: {failed})" if failed else "")
+                    + "…"
+                )
+            except Exception:
+                pass
     return media_map
 
 
@@ -449,7 +463,7 @@ async def exportuser_cmd(message: Message, command: CommandObject, db: Database,
     status = await message.answer(
         f"⏳ Собираю выгрузку: {len(rows)} сообщений" + (f", скачиваю {media_count} файлов…" if media_count else "…")
     )
-    media_map = await _collect_media(message, rows)
+    media_map = await _collect_media(message, rows, status_msg=status)
     html_data = _build_export_html(rows, target_uid, settings, media_map)
 
     # Лимит Telegram на загрузку ботом — 50 МБ, поэтому режем на части (index.html — в первой)
