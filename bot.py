@@ -8,10 +8,8 @@ from logging.handlers import RotatingFileHandler
 
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
-from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.enums import ParseMode
 from aiogram.types import ErrorEvent
-from aiohttp import ClientTimeout
 
 from config import Settings, load_settings
 from db import Database
@@ -63,11 +61,7 @@ async def main() -> None:
     db = Database(settings.db_path, settings.owner_id)
     await db.connect()
 
-    bot = Bot(
-        settings.bot_token,
-        default=DefaultBotProperties(parse_mode=ParseMode.HTML),
-        session=AiohttpSession(timeout=ClientTimeout(total=30, connect=5, sock_read=8)),
-    )
+    bot = Bot(settings.bot_token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher(db=db, settings=settings)
     dp.include_router(business.router)
     dp.include_router(private.router)
