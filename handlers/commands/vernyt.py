@@ -1,7 +1,9 @@
+import random
+
 from handlers.commands import CommandContext, command
 
 
-def _loading_frames() -> list[str]:
+def _loading_frames(success: bool) -> list[str]:
     bar_len = 10
     frames = []
 
@@ -18,13 +20,25 @@ def _loading_frames() -> list[str]:
             f"[{filled}{empty}] {percent}%"
         )
 
-    # Взрыв + финал
-    frames.append("💥💥💥💥💥💥💥💥💥💥")
-    frames.append("💥💥💥💥💥💥💥💥💥💥\n\n<b>ВОЗВРАТ НЕВОЗМОЖЕН, ВЫ СЛИШКОМ ТОЛСТИ</b>")
+    # Финал
+    if success:
+        frames.append(
+            "✨✨✨✨✨✨✨✨✨✨\n\n"
+            "<b>ВОЗВРАТ УСПЕШЕН (ГАЛКА)</b>\n\n"
+            "<b>ВЛАДИК ВЕРНЕТСЯ.</b>\n\n"
+            "<b>ОЖИДАЙТЕ.</b> 🕊️"
+        )
+    else:
+        frames.append("💥💥💥💥💥💥💥💥💥💥")
+        frames.append(
+            "💥💥💥💥💥💥💥💥💥💥\n\n"
+            "<b>ВОЗВРАТ НЕВОЗМОЖЕН, ВЫ СЛИШКОМ ТОЛСТИ</b> 🐷"
+        )
 
     return frames
 
 
 @command("вернуть", aliases=("vernyt",), description="вернуть Владика")
 async def vernyt(ctx: CommandContext) -> None:
-    await ctx.animate(_loading_frames(), delay=0.7)
+    success = random.random() < 0.02  # 2% шанс успеха
+    await ctx.animate(_loading_frames(success), delay=0.7)
